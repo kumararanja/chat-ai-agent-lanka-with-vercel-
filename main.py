@@ -1,19 +1,35 @@
 import replicate
+import os
 from fastapi import FastAPI, File, UploadFile
 from pydantic import BaseModel
 import chromadb
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 import pdfplumber
 
-# --- 1. Initialize Components ---
+# --- 1. Initialize Components and Handle API Token ---
+
+# Get the Replicate API token from the environment variable
+replicate_api_token = os.environ.get("REPLICATE_API_TOKEN")
+if not replicate_api_token:
+    raise ValueError("REPLICATE_API_TOKEN environment variable not set. Please set it in your Render dashboard.")
+
+# Create a Replicate client instance using the token
+replicate_client = replicate.Client(replicate_api_token)
+
+# Initialize the FastAPI app
 app = FastAPI()
+
 # Use a cheap, effective embedding model on Replicate
-embedding_model = replicate.models.get("sentence-transformers/all-MiniLM-l6-v2")
+# This model converts text into numerical vectors for searching
+embedding_model = replicate_client.models.get("sentence-transformers/all-MiniLM-l6-v2")
+
 # Initialize ChromaDB (in-memory for now, can be persistent)
+# This is our vector database to store the PDF content
 client = chromadb.Client()
 collection = client.create_collection("pdf_knowledge_base", embedding_function=SentenceTransformerEmbeddingFunction())
 
 # --- 2. API Endpoint to Ingest PDF ---
+# This endpoint allows you to upload a PDF and store its content in ChromaDB
 @app.post("/ingest-pdf/")
 async def ingest_pdf(file: UploadFile = File(...)):
     # Read the PDF content
@@ -22,7 +38,7 @@ async def ingest_pdf(file: UploadFile = File(...)):
         for page in pdf.pages:
             full_text += page.extract_text()
 
-    # Chunk the text (simple example, you can make this smarter)
+    # Simple text chunking (you can make this more sophisticated)
     chunks = [full_text[i:i+1000] for i in range(0, len(full_text), 1000)]
     
     # Add chunks to ChromaDB
@@ -36,32 +52,34 @@ async def ingest_pdf(file: UploadFile = File(...)):
     return {"message": f"Successfully ingested {len(chunks)} chunks from {file.filename}"}
 
 # --- 3. API Endpoint to Answer Questions ---
+# This endpoint takes a question and returns an answer based on the PDF content
 class Question(BaseModel):
     question: str
 
 @app.post("/ask/")
 async def ask_question(question: Question):
-    # 1. Generate embedding for the user's question
+    # 1. Generate an embedding for the user's question
+    # This allows us to find relevant text chunks in our database
     question_embedding = embedding_model.predict(input=question.question)
 
-    # 2. Retrieve relevant chunks from ChromaDB
+    # 2. Retrieve the most relevant text chunks from ChromaDB
     results = collection.query(
         query_embeddings=[question_embedding],
         n_results=5  # Get top 5 most relevant chunks
     )
 
     # 3. Format the context for the LLM
+    # We combine the retrieved chunks into a single block of text
     context = "\n\n".join(results['documents'][0])
     prompt = f"Answer the question based ONLY on the following context:\n\nContext: {context}\n\nQuestion: {question.question}\n\nAnswer:"
 
-    # 4. Call the LLM on Replicate to generate the answer
-    # Using a cost-effective model like Llama 3.1 8B
-    llm_model = replicate.models.get("meta/llama-3.1-8b-instruct")
+    # 4. Call the LLM (Gemini 2.5 Flash) on Replicate to generate the answer
+    llm_model = replicate_client.models.get("google/gemini-2.5-flash")
     output = llm_model.predict(
         input={
             "prompt": prompt,
             "max_tokens": 500,
-            "temperature": 0.1  # Lower temp for more factual answers
+            "temperature": 0.1  # Lower temperature for more factual answers
         }
     )
 
